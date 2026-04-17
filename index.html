@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>拼图</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+        }
+        body {
+            background: #242424;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: system-ui, 'Segoe UI', sans-serif;
+        }
+        .game-container {
+            background: #0b0d15;
+            padding: 20px;
+            border-radius: 32px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+            position: relative;          /* 新增：让按钮相对于此容器居中 */
+            max-width: 100vw;            /* 新增：限制容器不超过视口宽度 */
+            max-height: 100vh;           /* 新增：限制容器不超过视口高度 */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: auto;
+            max-width: 100%;
+            max-height: calc(100vh - 40px); /* 新增：减去容器内边距，防止画布被裁剪 */
+            border-radius: 20px;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05), 0 0 0 1px #2f3542;
+            cursor: grab;
+            touch-action: none;
+            object-fit: contain;         /* 新增：保证画布内容等比缩放（虽然canvas不一定支持，但无害） */
+        }
+        canvas:active {
+            cursor: grabbing;
+        }
+        .toolbar {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 16px;
+            gap: 20px;
+            align-items: center;
+        }
+        .fullscreen-btn {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 16px 32px;
+            background: #6c5ce7;
+            color: white;
+            border: none;
+            border-radius: 48px;
+            font-size: 20px;
+            font-weight: bold;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+            cursor: pointer;
+            z-index: 100;
+            border: 2px solid #a29bfe;
+            white-space: nowrap;         /* 防止文字换行 */
+        }
+        .fullscreen-btn.hidden {
+            display: none;
+        }
+        .debug-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #aab3cf;
+            font-size: 16px;
+        }
+        .debug-label input {
+            width: 20px;
+            height: 20px;
+            accent-color: #6c5ce7;
+        }
+        .note {
+            color: #5f6a84;
+            font-size: 14px;
+        }
+        /* 提示横屏的友好信息 */
+        @media (orientation: portrait) {
+            body::before {
+                content: "请将设备旋转至横屏以获得最佳体验";
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                background: #000000cc;
+                color: white;
+                padding: 16px 32px;
+                border-radius: 48px;
+                font-size: 20px;
+                z-index: 999;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="game-container">
+    <canvas id="puzzleCanvas" width="2000" height="1500"></canvas>
+    <button id="fullscreenBtn" class="fullscreen-btn">旋转屏幕 / 全屏</button>
+    <div class="toolbar">
+        <span class="note">拖动碎片至左侧拼合 · 阈值50px</span>
+        <label class="debug-label">
+            <input type="checkbox" id="debugModeCheckbox"> 调试模式 (显示坐标)
+        </label>
+    </div>
+</div>
+
+<script>
+    (function(){
+        "use strict";
+
+        // ---------- 配置参数 ----------
+        const CONFIG = {
+            // 画布逻辑尺寸
+            CANVAS_WIDTH: 2000,
+            CANVAS_HEIGHT: 1500,
+            // 左侧拼图区 (圆角矩形边框区域)
+            LEFT_AREA: { x: 100, y: 100, w: 900, h: 1300 },
+            // 整体图显示区域约束 (居中，最大包围盒)
+            HINT_MAX_W: 700,
+            HINT_MAX_H: 1100,
+            // 吸附阈值 (像素)
+            SNAP_THRESHOLD: 50,
+            // 返回动画时长 (ms)
+            ANIMATION_DURATION: 250,
+            // 边缘闪光持续时间 (ms)
+            FLASH_DURATION: 200,
+            // 图片路径
+            IMG_PUZZLE_FULL: 'images/puzzle.png',
+            IMG_PUZZLE_PIECES: [
+                'images/puzzle_01.png',
+                'images/puzzle_02.png',
+                'images/puzzle_03.png',
+                'images/puzzle_04.png',
+                'images/puzzle_05.png',
+                'images/puzzle_06.png',
+                'images/puzzle_07.png'
+            ]
+        };
+
+        // ---------- 全局变量 ----------
+        const canvas = document.getElementById('puzzleCanvas');
+        const ctx = canvas.getContext('2d', { alpha: true });
+        const debugCheckbox = document.getElementById('debugModeCheckbox');
+
+        // 游戏状态
+        let pieces = [];                    // 碎片数据数组
+        let fullImage = null;               // 整体图 Image 对象
+        let globalScale = 1.0;              // 统一缩放比例
+        let hintDrawPos = { x: 0, y: 0 };    // 整体图在画布上的绘制起始坐标 (左上角)
+        
+        // 拖拽状态
+        let isDragging = false;
+        let dragPieceIndex = -1;            // 当前拖拽的碎片索引
+        let dragOffsetX = 0, dragOffsetY = 0; // 鼠标相对于碎片中心的偏移
+        let dragStartPlaced = false;        // 拖拽开始时碎片是否已归位
+        
+        // 动画管理
+        let animatingPieces = new Set();     // 存放正在动画的碎片索引
+        
+        // 闪光效果
+        let flashPieceIndex = -1;
+        let flashStartTime = 0;
+        
+        // 整体图不透明度 (0~1)
+        let hintOpacity = 0.5;
+        
+        // 坐标转换缓存
+        let canvasRect = canvas.getBoundingClientRect();
+        
+        // 调试模式 (由复选框控制)
+        let debugMode = false;
+        
+        // 动画循环 ID
+        let animationFrame = null;
+        
+        // 图片加载计数器
+        let imagesLoaded = 0;
+        const totalImages = 1 + CONFIG.IMG_PUZZLE_PIECES.length; // 整体图 + 7碎片
+        
+        // ---------- 辅助函数：坐标转换 ----------
+        function updateCanvasRect() {
+            canvasRect = canvas.getBoundingClientRect();
+        }
+        
+        // 将屏幕坐标 (clientX, clientY) 转换为画布逻辑坐标
+        function screenToCanvas(clientX, clientY) {
+            const sx = (clientX - canvasRect.left) / canvasRect.width;
+            const sy = (clientY - canvasRect.top) / canvasRect.height;
+            return {
+                x: Math.min(CONFIG.CANVAS_WIDTH, Math.max(0, sx * CONFIG.CANVAS_WIDTH)),
+                y: Math.min(CONFIG.CANVAS_HEIGHT, Math.max(0, sy * CONFIG.CANVAS_HEIGHT))
+            };
+        }
+        
+        /*
+        // ---------- 轮廓多边形生成 (基于 getImageData) ----------
+        // 使用 Marching Squares 提取外轮廓 (仅外部边界，简化实现)
+        function generatePolygonFromImage(img) {
+            // 创建临时 canvas 获取像素数据
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = img.width;
+            tempCanvas.height = img.height;
+            const tempCtx = tempCanvas.getContext('2d');
+            tempCtx.drawImage(img, 0, 0);
+            const imageData = tempCtx.getImageData(0, 0, img.width, img.height);
+            const data = imageData.data;
+            const w = img.width;
+            const h = img.height;
+            
+            // 简化方案：通过扫描线提取一系列边界点，然后使用凸包或简单轮廓跟踪。
+            // 但更稳健的做法：使用 alpha 阈值，找到第一个不透明像素，然后用边界跟踪算法。
+            // 这里为了简化并保证性能，采用 "轮廓点采样 + 简化" 方法。
+            // 实际拼图游戏通常只需近似多边形即可，我们采用 "marching squares" 轮廓提取。
+            
+            // 定义阈值 (alpha > 0 视为不透明)
+            const threshold = 10;
+            
+            // 辅助函数：获取像素alpha
+            function getAlpha(x, y) {
+                if (x < 0 || x >= w || y < 0 || y >= h) return 0;
+                const idx = (y * w + x) * 4 + 3;
+                return data[idx];
+            }
+            
+            // 使用 "marching squares" 轮廓追踪 (简化版，只提取外轮廓)
+            // 为了简洁且可靠，采用 "边界点扫描 + 排序" 方式生成多边形。
+            // 但注意：对于凹多边形可能不完美，不过对于拼图碎片通常足够。
+            // 下面实现一个简单的轮廓追踪：
+            
+            // 1. 找到第一个不透明像素作为起点
+            let startX = -1, startY = -1;
+            outer: for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    if (getAlpha(x, y) > threshold) {
+                        startX = x;
+                        startY = y;
+                        break outer;
+                    }
+                }
+            }
+            if (startX === -1) return []; // 全透明图片
+            
+            // 2. 边界跟踪 (Moore-Neighbor tracing)
+            const dirs = [
+                {dx: 1, dy: 0},   // 右
+                {dx: 1, dy: -1},  // 右上
+                {dx: 0, dy: -1},  // 上
+                {dx: -1, dy: -1}, // 左上
+                {dx: -1, dy: 0},  // 左
+                {dx: -1, dy: 1},  // 左下
+                {dx: 0, dy: 1},   // 下
+                {dx: 1, dy: 1}    // 右下
+            ];
+            
+            const visited = new Set();
+            const boundary = [];
+            
+            let curX = startX, curY = startY;
+            let dir = 0; // 初始搜索方向
+            
+            // 最多迭代次数防止死循环
+            const maxIter = w * h * 2;
+            let iter = 0;
+            
+            do {
+                const key = `${curX},${curY}`;
+                if (visited.has(key)) break;
+                visited.add(key);
+                boundary.push({x: curX, y: curY});
+                
+                // 寻找下一个边界点：从当前方向逆时针旋转，找到第一个背景->前景的边界
+                let found = false;
+                for (let i = 0; i < 8; i++) {
+                    const checkDir = (dir + i) % 8;
+                    const nx = curX + dirs[checkDir].dx;
+                    const ny = curY + dirs[checkDir].dy;
+                    
+                    if (nx >= 0 && nx < w && ny >= 0 && ny < h && getAlpha(nx, ny) > threshold) {
+                        // 移动到该点
+                        curX = nx;
+                        curY = ny;
+                        dir = (checkDir + 4) % 8; // 调整方向
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+                
+                iter++;
+                if (iter > maxIter) {
+                    console.warn('轮廓追踪超时');
+                    break;
+                }
+            } while (!(curX === startX && curY === startY));
+            
+            // 简化多边形 (可选，减少点数)
+            // 这里直接返回原始边界点，后续碰撞检测使用点阵即可
+            return boundary;
+        }*/
+        
+        // 判断点是否在多边形内 (射线法)
+        function pointInPolygon(px, py, polygon) {
+            if (!polygon || polygon.length < 3) return false;
+            let inside = false;
+            for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                const xi = polygon[i].x, yi = polygon[i].y;
+                const xj = polygon[j].x, yj = polygon[j].y;
+                const intersect = ((yi > py) !== (yj > py)) &&
+                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+                if (intersect) inside = !inside;
+            }
+            return inside;
+        }
+        
+        // 判断多边形是否与矩形 (rx, ry, rw, rh) 相交
+        function polygonIntersectsRect(polygon, rx, ry, rw, rh) {
+            // 简单检查：多边形任一顶点在矩形内，或矩形的边与多边形相交 (粗略)
+            for (let p of polygon) {
+                if (p.x >= rx && p.x <= rx + rw && p.y >= ry && p.y <= ry + rh) {
+                    return true;
+                }
+            }
+            // 进一步检查矩形的四个角是否在多边形内
+            const corners = [
+                {x: rx, y: ry}, {x: rx+rw, y: ry}, 
+                {x: rx+rw, y: ry+rh}, {x: rx, y: ry+rh}
+            ];
+            for (let c of corners) {
+                if (pointInPolygon(c.x, c.y, polygon)) return true;
+            }
+            // 可加入边相交检测，但为简化，以上已覆盖绝大多数情况
+            return false;
+        }
+        
+        // ---------- 初始化数据 ----------
+        function initPiecesData() {
+            // 手动填入每块碎片的初始位置和正确位置 (由调试模式确定)
+            // 这里提供一组临时占位坐标，实际需通过调试拖拽确定后修改。
+            // 注意：坐标均为画布逻辑坐标，碎片中心点。
+            pieces = [
+                { id: 1, initX: 1430, initY: 568, correctX: 550, correctY: 750 },
+                { id: 2, initX: 1600, initY: 600, correctX: 550, correctY: 750 },
+                { id: 3, initX: 1400, initY: 700, correctX: 550, correctY: 750 },
+                { id: 4, initX: 1520, initY: 680, correctX: 550, correctY: 750 },
+                { id: 5, initX: 1600, initY: 800, correctX: 550, correctY: 750 },
+                { id: 6, initX: 1400, initY: 850, correctX: 550, correctY: 750 },
+                { id: 7, initX: 1550, initY: 930, correctX: 550, correctY: 750 }
+            ];
+            // 注意：以上坐标仅为示例，必须根据实际图片调试修改！
+            //随机偏移初始位置
+            /*pieces.forEach(p => {
+                p.initX = 1200 + Math.random() * 200;
+                p.initY = 400 + Math.random() * 300;
+            });*/
+        }
+
+        // ========== 由 Python 脚本生成的多边形数据 ==========
+        const piecePolygons = {
+            1: [{"x":938,"y":0},{"x":416,"y":0},{"x":333,"y":17},{"x":317,"y":63},{"x":419,"y":176},{"x":436,"y":225},{"x":111,"y":450},{"x":424,"y":397},{"x":674,"y":300},{"x":851,"y":160}],
+            2: [{"x":939,"y":0},{"x":894,"y":102},{"x":808,"y":204},{"x":896,"y":335},{"x":1281,"y":744},{"x":1451,"y":848},{"x":1609,"y":907},{"x":1641,"y":689},{"x":1598,"y":538},{"x":1479,"y":404},{"x":1204,"y":222},{"x":1320,"y":70},{"x":1323,"y":31},{"x":1239,"y":1}],
+            3: [{"x":792,"y":1005},{"x":648,"y":911},{"x":518,"y":737},{"x":492,"y":579},{"x":530,"y":364},{"x":344,"y":416},{"x":111,"y":450},{"x":50,"y":526},{"x":0,"y":683},{"x":32,"y":904},{"x":278,"y":997},{"x":423,"y":1030},{"x":611,"y":1036}],
+            4: [{"x":809,"y":205},{"x":681,"y":296},{"x":530,"y":363},{"x":493,"y":551},{"x":504,"y":693},{"x":546,"y":789},{"x":661,"y":923},{"x":791,"y":1004},{"x":1134,"y":882},{"x":1320,"y":773},{"x":1013,"y":476}],
+            5: [{"x":1609,"y":908},{"x":1319,"y":773},{"x":1206,"y":847},{"x":999,"y":936},{"x":781,"y":1008},{"x":612,"y":1036},{"x":1092,"y":1183},{"x":1240,"y":1275},{"x":1382,"y":1408},{"x":1526,"y":1134}],
+            6: [{"x":31,"y":904},{"x":107,"y":1116},{"x":239,"y":1374},{"x":576,"y":1275},{"x":1184,"y":1236},{"x":1067,"y":1172},{"x":615,"y":1036},{"x":351,"y":1017}],
+            7: [{"x":1382,"y":1409},{"x":1185,"y":1236},{"x":563,"y":1277},{"x":239,"y":1375},{"x":489,"y":1737},{"x":1159,"y":1735}],
+        };
+        // =================================================
+        
+        // ---------- 图片加载与初始化 ----------
+        async function loadImages() {
+            // --- 加载整体图 ---
+            const fullImgPromise = new Promise((resolve, reject) => {
+                fullImage = new Image();
+                fullImage.src = CONFIG.IMG_PUZZLE_FULL;
+                fullImage.onload = () => {
+                    console.log('✅ 整体图加载成功, 尺寸:', fullImage.width, 'x', fullImage.height);
+                    resolve();
+                };
+                fullImage.onerror = () => {
+                    console.error('❌ 整体图加载失败，路径：' + CONFIG.IMG_PUZZLE_FULL);
+                    reject('整体图加载失败');
+                };
+            });
+
+            // --- 初始化碎片数据（坐标）---
+            initPiecesData();
+
+            // --- 加载所有碎片图 ---
+            const piecePromises = CONFIG.IMG_PUZZLE_PIECES.map((src, index) => {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.src = src;
+                    img.onload = function() {
+                        const piece = pieces[index];
+                        piece.img = this;
+                        piece.origW = this.width;
+                        piece.origH = this.height;
+                        piece.polygon = piecePolygons[index + 1];
+                        console.log(`✅ 碎片 ${index+1} 加载成功, 尺寸: ${this.width} x ${this.height}`);
+                        resolve();
+                    };
+                    img.onerror = () => {
+                        console.error(`❌ 碎片 ${index+1} 加载失败，路径：${src}`);
+                        reject(`碎片 ${index+1} 加载失败`);
+                    };
+                });
+            });
+
+            try {
+                // 等待所有图片加载完成
+                await Promise.all([fullImgPromise, ...piecePromises]);
+                console.log('🎉 所有图片加载完成，启动游戏');
+                startGame();
+            } catch (error) {
+                console.warn('⚠️ 部分图片加载失败，仍尝试启动游戏（将显示占位符）');
+                startGame(); // 即使失败也继续，以便显示错误提示
+            }
+        }
+        
+        // ---------- 计算缩放与布局 ----------
+        function computeScaleAndLayout() {
+            // 防御：如果整体图未加载，使用默认尺寸（防止 NaN）
+            const fw = fullImage ? fullImage.width : 1000;
+            const fh = fullImage ? fullImage.height : 1000;
+            
+            globalScale = Math.min(CONFIG.HINT_MAX_W / fw, CONFIG.HINT_MAX_H / fh);
+            console.log('🔧 globalScale 计算值:', globalScale);
+            
+            // 整体图绘制位置
+            const hintW = fw * globalScale;
+            const hintH = fh * globalScale;
+            hintDrawPos.x = CONFIG.LEFT_AREA.x + (CONFIG.LEFT_AREA.w - hintW) / 2;
+            hintDrawPos.y = CONFIG.LEFT_AREA.y + (CONFIG.LEFT_AREA.h - hintH) / 2;
+            
+            // 计算每块碎片的显示尺寸
+            pieces.forEach((p, idx) => {
+                // 若碎片图片未加载，使用默认宽高
+                const origW = p.origW || 200;
+                const origH = p.origH || 200;
+                p.dispW = origW * globalScale;
+                p.dispH = origH * globalScale;
+                p.currentX = p.initX;
+                p.currentY = p.initY;
+                p.placed = false;
+                p.isAnimating = false;
+                console.log(`🔧 碎片 ${idx+1}: dispW=${p.dispW.toFixed(1)}, dispH=${p.dispH.toFixed(1)}, pos=(${p.currentX}, ${p.currentY})`);
+            });
+        }
+        
+        // ---------- 启动游戏循环 ----------
+        function startGame() {
+            computeScaleAndLayout();
+
+            // 【新增】打印缩放与碎片尺寸，便于排查
+            console.log('globalScale:', globalScale);
+            pieces.forEach((p, idx) => {
+                console.log(`碎片 ${idx+1}: origW=${p.origW}, origH=${p.origH}, dispW=${p.dispW}, dispH=${p.dispH}`);
+            });
+            
+            // 初始整体图不透明度
+            hintOpacity = 0.5;
+            // 开始绘制
+            if (animationFrame) cancelAnimationFrame(animationFrame);
+            function drawLoop() {
+                updateCanvasRect();
+                drawScene();
+                animationFrame = requestAnimationFrame(drawLoop);
+            }
+            animationFrame = requestAnimationFrame(drawLoop);
+        }
+        
+        // ---------- 绘制场景 ----------
+        function drawScene() {
+            ctx.clearRect(0, 0, CONFIG.CANVAS_WIDTH, CONFIG.CANVAS_HEIGHT);
+            
+            // 1. 绘制左侧拼图区圆角矩形外框
+            ctx.save();
+            ctx.strokeStyle = '#c2c2c2';
+            ctx.lineWidth = 10;
+            ctx.fillStyle = '#7d7d7d';
+            ctx.beginPath();
+            ctx.roundRect(CONFIG.LEFT_AREA.x, CONFIG.LEFT_AREA.y, CONFIG.LEFT_AREA.w, CONFIG.LEFT_AREA.h, 24);
+            ctx.fill();
+            ctx.stroke();
+            ctx.restore();
+            
+            // 2. 绘制整体提示图 (底层，半透明)
+            if (fullImage) {
+                const drawW = fullImage.width * globalScale;
+                const drawH = fullImage.height * globalScale;
+                ctx.save();
+                ctx.globalAlpha = hintOpacity;
+                ctx.drawImage(fullImage, hintDrawPos.x, hintDrawPos.y, drawW, drawH);
+                
+                // 调试模式：绘制亮蓝色边框标示整体图区域
+                if (debugMode) {
+                    ctx.globalAlpha = 1.0;
+                    ctx.strokeStyle = '#00ffff';
+                    ctx.lineWidth = 6;
+                    ctx.strokeRect(hintDrawPos.x, hintDrawPos.y, drawW, drawH);
+                }
+                ctx.restore();
+            } else {
+                // 整体图未加载时显示文字
+                ctx.font = 'bold 40px system-ui';
+                ctx.fillStyle = '#aaa';
+                ctx.fillText('⚠️ 整体图未加载', 400, 200);
+            }
+            
+            // 3. 绘制已归位的碎片 (placed == true)
+            pieces.forEach(piece => {
+                if (piece.placed) {
+                    drawPiece(piece);
+                }
+            });
+            
+            // 4. 绘制未归位碎片 (placed == false)，但排除正在拖拽的（拖拽的会最后单独绘制）
+            pieces.forEach(piece => {
+                if (!piece.placed && !piece.isAnimating) {
+                    // 如果正在拖拽且索引匹配，则跳过，稍后绘制
+                    if (isDragging && pieces.indexOf(piece) === dragPieceIndex) return;
+                    drawPiece(piece);
+                }
+            });
+            
+            // 5. 绘制正在动画的碎片 (它们也属于未归位)
+            pieces.forEach(piece => {
+                if (piece.isAnimating) {
+                    drawPiece(piece);
+                }
+            });
+            
+            // 6. 绘制正在拖拽的碎片 (最上层)
+            if (isDragging && dragPieceIndex !== -1) {
+                const piece = pieces[dragPieceIndex];
+                drawPiece(piece);
+            }
+            
+            // 7. 绘制闪光效果 (如果有)
+            if (flashPieceIndex !== -1) {
+                const piece = pieces[flashPieceIndex];
+                const now = performance.now();
+                if (now - flashStartTime < CONFIG.FLASH_DURATION) {
+                    ctx.save();
+                    ctx.shadowColor = '#ffdd55';
+                    ctx.shadowBlur = 25;
+                    ctx.shadowOffsetX = 0;
+                    ctx.shadowOffsetY = 0;
+                    // 绘制带阴影的图片 (阴影即闪光)
+                    drawPieceImage(piece);
+                    ctx.restore();
+                } else {
+                    flashPieceIndex = -1;
+                }
+            }
+            
+            // 8. 调试模式: 绘制坐标文本
+            if (debugMode) {
+                ctx.save();
+                ctx.font = 'bold 20px "Segoe UI", monospace';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                pieces.forEach(piece => {
+                    const x = piece.currentX;
+                    const y = piece.currentY;
+                    ctx.fillStyle = '#ffffff';
+                    ctx.shadowColor = '#000000';
+                    ctx.shadowBlur = 6;
+                    ctx.shadowOffsetX = 2;
+                    ctx.shadowOffsetY = 2;
+                    ctx.fillText(`初始:(${Math.round(piece.initX)},${Math.round(piece.initY)})`, x, y - 40);
+                    ctx.fillText(`正确:(${Math.round(piece.correctX)},${Math.round(piece.correctY)})`, x, y - 15);
+                    ctx.fillText(`当前:(${Math.round(piece.currentX)},${Math.round(piece.currentY)})`, x, y + 10);
+                });
+                ctx.restore();
+            }
+
+            // 9. 调试模式：绘制每个碎片的多边形轮廓（增强可见性）
+            if (debugMode) {
+                ctx.save();
+                ctx.shadowColor = '#000';
+                ctx.shadowBlur = 0; // 先关闭阴影避免干扰
+                pieces.forEach(piece => {
+                    if (!piece.polygon || piece.polygon.length === 0) {
+                        console.warn(`⚠️ 碎片 ${piece.id} 无多边形数据`);
+                        return;
+                    }
+                    
+                    const centerX = piece.currentX;
+                    const centerY = piece.currentY;
+                    const scale = globalScale || 1;
+                    const offsetX = -piece.origW / 2;
+                    const offsetY = -piece.origH / 2;
+                    
+                    ctx.beginPath();
+                    const first = piece.polygon[0];
+                    let startX = centerX + (first.x + offsetX) * scale;
+                    let startY = centerY + (first.y + offsetY) * scale;
+                    ctx.moveTo(startX, startY);
+                    
+                    for (let i = 1; i < piece.polygon.length; i++) {
+                        const pt = piece.polygon[i];
+                        const x = centerX + (pt.x + offsetX) * scale;
+                        const y = centerY + (pt.y + offsetY) * scale;
+                        ctx.lineTo(x, y);
+                    }
+                    ctx.closePath();
+                    
+                    // 半透明红色填充，让多边形区域一目了然
+                    ctx.fillStyle = 'rgba(255, 0, 0, 0.3)';
+                    ctx.fill();
+                    // 白色边界线
+                    ctx.strokeStyle = '#ffffff';
+                    ctx.lineWidth = 4;
+                    ctx.stroke();
+                });
+                ctx.restore();
+            }
+        }
+        
+        function drawPiece(piece) {
+            drawPieceImage(piece);
+        }
+        
+        function drawPieceImage(piece) {
+            const img = piece.img;
+            
+            // 诊断：图片未加载时显示粉色方块
+            if (!img) {
+                ctx.fillStyle = '#ff00ff';
+                ctx.fillRect(piece.currentX - 25, piece.currentY - 25, 50, 50);
+                return;
+            }
+            
+            const w = piece.dispW;
+            const h = piece.dispH;
+            
+            // 诊断：尺寸无效时显示红色叉叉
+            if (!w || !h || w <= 0 || h <= 0) {
+                ctx.strokeStyle = '#ff0000';
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.moveTo(piece.currentX - 30, piece.currentY - 30);
+                ctx.lineTo(piece.currentX + 30, piece.currentY + 30);
+                ctx.moveTo(piece.currentX + 30, piece.currentY - 30);
+                ctx.lineTo(piece.currentX - 30, piece.currentY + 30);
+                ctx.stroke();
+                return;
+            }
+            
+            const x = piece.currentX - w / 2;
+            const y = piece.currentY - h / 2;
+            ctx.drawImage(img, x, y, w, h);
+            
+            // 可选：在碎片周围绘制半透明边框（调试时可取消注释）
+            // ctx.strokeStyle = '#00ffff';
+            // ctx.lineWidth = 2;
+            // ctx.strokeRect(x, y, w, h);
+        }
+        
+        // 添加 roundRect 方法
+        CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+            if (w < 2 * r) r = w / 2;
+            if (h < 2 * r) r = h / 2;
+            this.moveTo(x + r, y);
+            this.lineTo(x + w - r, y);
+            this.quadraticCurveTo(x + w, y, x + w, y + r);
+            this.lineTo(x + w, y + h - r);
+            this.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+            this.lineTo(x + r, y + h);
+            this.quadraticCurveTo(x, y + h, x, y + h - r);
+            this.lineTo(x, y + r);
+            this.quadraticCurveTo(x, y, x + r, y);
+            return this;
+        };
+        
+        // ---------- 事件处理 ----------
+        function handleDragStart(clientX, clientY) {
+            if (!pieces.length) return;
+            const pos = screenToCanvas(clientX, clientY);
+            
+            // 从上到下遍历 (需模拟绘制顺序: 未归位 > 动画中)
+            // 构建一个数组表示当前可拖拽碎片的顺序 (最后绘制的最上层)
+            const draggableIndices = [];
+            pieces.forEach((p, idx) => {
+                if (p.isAnimating) {
+                    p.isAnimating = false;
+                    animatingPieces.delete(p.id);
+                }
+                draggableIndices.push(idx);  // 所有碎片均可拖拽（动画已被终止）
+            });
+            // 注意：动画中的碎片不可拖拽
+            
+            // 反向遍历，因为最后绘制的最上层
+            for (let i = draggableIndices.length - 1; i >= 0; i--) {
+                const idx = draggableIndices[i];
+                const piece = pieces[idx];
+                
+                // 将鼠标坐标转换到碎片局部坐标系 (考虑缩放和位置)
+                const localX = (pos.x - piece.currentX) / globalScale + piece.origW / 2;
+                const localY = (pos.y - piece.currentY) / globalScale + piece.origH / 2;
+                
+                // 检查点是否在多边形内
+                if (pointInPolygon(localX, localY, piece.polygon)) {
+                    // 开始拖拽
+                    isDragging = true;
+                    dragPieceIndex = idx;
+                    dragOffsetX = piece.currentX - pos.x;
+                    dragOffsetY = piece.currentY - pos.y;
+                    dragStartPlaced = piece.placed;
+                    
+                    if (piece.placed) {
+                        piece.placed = false;
+                        // 整体图不透明度变回50%
+                        hintOpacity = 0.5;
+                    }
+                    
+                    // 提升该碎片绘制层级 (通过最后绘制实现，不需要额外操作)
+                    break;
+                }
+            }
+        }
+        
+        function handleDragMove(clientX, clientY) {
+            if (!isDragging || dragPieceIndex === -1) return;
+            const piece = pieces[dragPieceIndex];
+            const pos = screenToCanvas(clientX, clientY);
+            
+            let newX = pos.x + dragOffsetX;
+            let newY = pos.y + dragOffsetY;
+            
+            // 【修改】基于多边形顶点的画布投影进行边界约束，而非整张图片矩形
+            // 计算多边形在当前临时位置下的画布坐标范围
+            const scale = globalScale;
+            const offsetX = -piece.origW / 2;
+            const offsetY = -piece.origH / 2;
+            
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            piece.polygon.forEach(pt => {
+                const x = newX + (pt.x + offsetX) * scale;
+                const y = newY + (pt.y + offsetY) * scale;
+                minX = Math.min(minX, x);
+                minY = Math.min(minY, y);
+                maxX = Math.max(maxX, x);
+                maxY = Math.max(maxY, y);
+            });
+            
+            // 计算需要调整的偏移量，使多边形完全在画布内
+            let adjustX = 0, adjustY = 0;
+            if (minX < 0) adjustX = -minX;
+            if (minY < 0) adjustY = -minY;
+            if (maxX > CONFIG.CANVAS_WIDTH) adjustX = CONFIG.CANVAS_WIDTH - maxX;
+            if (maxY > CONFIG.CANVAS_HEIGHT) adjustY = CONFIG.CANVAS_HEIGHT - maxY;
+            
+            newX += adjustX;
+            newY += adjustY;
+            
+            piece.currentX = newX;
+            piece.currentY = newY;
+        }
+        
+        function handleDragEnd(clientX, clientY) {
+            if (!isDragging || dragPieceIndex === -1) {
+                isDragging = false;
+                return;
+            }
+            
+            const piece = pieces[dragPieceIndex];
+            const pos = screenToCanvas(clientX, clientY);
+            
+            // 更新最终位置
+            let finalX = pos.x + dragOffsetX;
+            let finalY = pos.y + dragOffsetY;
+
+            // 【修改】基于多边形顶点范围进行边界约束，确保不透明区域不超出画布
+            const scale = globalScale;
+            const offsetX = -piece.origW / 2;
+            const offsetY = -piece.origH / 2;
+
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            piece.polygon.forEach(pt => {
+                const x = finalX + (pt.x + offsetX) * scale;
+                const y = finalY + (pt.y + offsetY) * scale;
+                minX = Math.min(minX, x);
+                minY = Math.min(minY, y);
+                maxX = Math.max(maxX, x);
+                maxY = Math.max(maxY, y);
+            });
+            
+            let adjustX = 0, adjustY = 0;
+            if (minX < 0) adjustX = -minX;
+            if (minY < 0) adjustY = -minY;
+            if (maxX > CONFIG.CANVAS_WIDTH) adjustX = CONFIG.CANVAS_WIDTH - maxX;
+            if (maxY > CONFIG.CANVAS_HEIGHT) adjustY = CONFIG.CANVAS_HEIGHT - maxY;
+            
+            finalX += adjustX;
+            finalY += adjustY;
+            piece.currentX = finalX;
+            piece.currentY = finalY;
+            
+            // 根据模式处理
+            if (debugMode) {
+                // 调试模式：不做任何吸附/返回
+            } else {
+                // 正式模式
+                const dx = Math.abs(piece.currentX - piece.correctX);
+                const dy = Math.abs(piece.currentY - piece.correctY);
+                
+                if (dx < CONFIG.SNAP_THRESHOLD && dy < CONFIG.SNAP_THRESHOLD) {
+                    // 吸附
+                    piece.currentX = piece.correctX;
+                    piece.currentY = piece.correctY;
+                    piece.placed = true;
+                    piece.isAnimating = false;
+                    
+                    // 触发闪光
+                    flashPieceIndex = dragPieceIndex;
+                    flashStartTime = performance.now();
+                    
+                    // 检查是否全部归位
+                    const allPlaced = pieces.every(p => p.placed);
+                    if (allPlaced) {
+                        hintOpacity = 1.0;
+                    }
+                } else {
+                    // 检查是否与左侧区域重叠 (使用多边形)
+                    // 将多边形顶点转换到画布坐标系
+                    const transformedPoly = piece.polygon.map(pt => ({
+                        x: piece.currentX + (pt.x - piece.origW/2) * globalScale,
+                        y: piece.currentY + (pt.y - piece.origH/2) * globalScale
+                    }));
+                    const overlaps = polygonIntersectsRect(transformedPoly, 
+                        CONFIG.LEFT_AREA.x, CONFIG.LEFT_AREA.y, 
+                        CONFIG.LEFT_AREA.w, CONFIG.LEFT_AREA.h);
+                    
+                    if (overlaps) {
+                        // 启动返回动画
+                        startReturnAnimation(piece);
+                    }
+                    // 否则停留在原地
+                }
+            }
+            
+            // 重置拖拽状态
+            isDragging = false;
+            dragPieceIndex = -1;
+        }
+        
+        // 返回动画 (ease-out)
+        function startReturnAnimation(piece) {
+            if (piece.isAnimating) return;
+            
+            const startX = piece.currentX;
+            const startY = piece.currentY;
+            const targetX = piece.initX;
+            const targetY = piece.initY;
+            const startTime = performance.now();
+            
+            piece.isAnimating = true;
+            animatingPieces.add(piece.id);
+            
+            function animateReturn(now) {
+                if (!piece.isAnimating) return;
+
+                const elapsed = now - startTime;
+                let t = Math.min(elapsed / CONFIG.ANIMATION_DURATION, 1);
+                // ease-out cubic
+                t = 1 - Math.pow(1 - t, 3);
+                
+                piece.currentX = startX + (targetX - startX) * t;
+                piece.currentY = startY + (targetY - startY) * t;
+                
+                if (t < 1) {
+                    requestAnimationFrame(animateReturn);
+                } else {
+                    // 动画结束，确保多边形完全在画布内（尽管目标位置应已合法，但以防万一）
+                    const scale = globalScale;
+                    const offsetX = -piece.origW / 2;
+                    const offsetY = -piece.origH / 2;
+                    
+                    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                    piece.polygon.forEach(pt => {
+                        const x = targetX + (pt.x + offsetX) * scale;
+                        const y = targetY + (pt.y + offsetY) * scale;
+                        minX = Math.min(minX, x);
+                        minY = Math.min(minY, y);
+                        maxX = Math.max(maxX, x);
+                        maxY = Math.max(maxY, y);
+                    });
+                    
+                    let adjustX = 0, adjustY = 0;
+                    if (minX < 0) adjustX = -minX;
+                    if (minY < 0) adjustY = -minY;
+                    if (maxX > CONFIG.CANVAS_WIDTH) adjustX = CONFIG.CANVAS_WIDTH - maxX;
+                    if (maxY > CONFIG.CANVAS_HEIGHT) adjustY = CONFIG.CANVAS_HEIGHT - maxY;
+                    
+                    piece.currentX = targetX + adjustX;
+                    piece.currentY = targetY + adjustY;
+                    piece.isAnimating = false;
+                    animatingPieces.delete(piece.id);
+                }
+            }
+            
+            requestAnimationFrame(animateReturn);
+        }
+
+        // ---------- 全屏按钮与旋转提示 ----------
+        const fullscreenBtn = document.getElementById('fullscreenBtn');
+
+        // 根据横竖屏状态更新按钮文字
+        function updateFullscreenBtnText() {
+            if (!fullscreenBtn) return;
+            const isPortrait = window.innerHeight > window.innerWidth;
+            // 竖屏时提示旋转，横屏时提示全屏
+            fullscreenBtn.textContent = isPortrait ? '↻ 请旋转屏幕' : '⛶ 全屏体验';
+        }
+
+        // 进入全屏（兼容各浏览器）
+        function enterFullscreen() {
+            const elem = document.documentElement;
+            if (elem.requestFullscreen) {
+                elem.requestFullscreen();
+            } else if (elem.webkitRequestFullscreen) {
+                elem.webkitRequestFullscreen();
+            } else if (elem.msRequestFullscreen) {
+                elem.msRequestFullscreen();
+            }
+        }
+
+        // 按钮点击处理：竖屏时弹窗提示旋转，横屏时进入全屏，点击后隐藏按钮
+        function onFullscreenBtnClick() {
+            const isPortrait = window.innerHeight > window.innerWidth;
+            if (isPortrait) {
+                alert('请将设备旋转至横屏以获得最佳体验');
+            } else {
+                enterFullscreen();
+            }
+            fullscreenBtn.classList.add('hidden');
+        }
+        
+        // ---------- 事件绑定 ----------
+        function bindEvents() {
+            canvas.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                handleDragStart(e.clientX, e.clientY);
+            });
+            
+            window.addEventListener('mousemove', (e) => {
+                if (isDragging) {
+                    e.preventDefault();
+                    handleDragMove(e.clientX, e.clientY);
+                }
+            });
+            
+            window.addEventListener('mouseup', (e) => {
+                if (isDragging) {
+                    e.preventDefault();
+                    handleDragEnd(e.clientX, e.clientY);
+                }
+            });
+            
+            // 触摸事件
+            canvas.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                const touch = e.touches[0];
+                handleDragStart(touch.clientX, touch.clientY);
+            }, {passive: false});
+            
+            canvas.addEventListener('touchmove', (e) => {
+                e.preventDefault();
+                if (isDragging) {
+                    const touch = e.touches[0];
+                    handleDragMove(touch.clientX, touch.clientY);
+                }
+            }, {passive: false});
+            
+            canvas.addEventListener('touchend', (e) => {
+                e.preventDefault();
+                if (isDragging) {
+                    handleDragEnd(0, 0); // 坐标不重要，使用最后一次移动位置
+                }
+            });
+            
+            // 窗口大小变化时，更新画布坐标缓存，并同步更新全屏按钮文字
+            window.addEventListener('resize', () => {
+                updateCanvasRect();
+                updateFullscreenBtnText();  // 新增：横竖屏切换时更新按钮提示
+            });
+            
+            // 调试模式切换（虽然工具栏隐藏，但复选框仍存在，保留功能）
+            debugCheckbox.addEventListener('change', (e) => {
+                debugMode = e.target.checked;
+            });
+
+            // 全屏按钮事件绑定
+            if (fullscreenBtn) {
+                fullscreenBtn.addEventListener('click', onFullscreenBtnClick);
+                // 初始化按钮文字
+                updateFullscreenBtnText();
+            }
+        }
+        
+        // ---------- 启动一切 ----------
+        function init() {
+            updateCanvasRect();
+            bindEvents();
+            loadImages();
+            updateFullscreenBtnText();
+        }
+        
+        init();
+    })();
+</script>
+</body>
+</html>
