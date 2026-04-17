@@ -747,16 +747,16 @@
             
             // ========== 光晕可配置参数（可根据需要自由调整） ==========
             // 描边层数：强度 1.0 时的层数 = baseLayers + intensity * layersMultiplier
-            const baseLayers = 15;           // 基础层数（强度0时的最小层数）
-            const layersMultiplier = 20;    // 层数乘数，强度1.0时总层数 = 3 + 12 = 15
+            const baseLayers = 5;           // 基础层数（强度0时的最小层数）
+            const layersMultiplier = 0;    // 层数乘数，强度1.0时总层数 = 3 + 12 = 15
             
             // 模糊半径：强度 1.0 时的模糊值 = baseBlur + intensity * blurMultiplier
             const baseBlur = 24;            // 基础模糊半径（逻辑像素）
             const blurMultiplier = 24;      // 模糊乘数，强度1.0时总模糊 = 16 + 12 = 28
             
             // 描边宽度
-            const baseLineWidth = 2;        // 最内层描边宽度（逻辑像素）
-            const widthStep = 2;            // 每层增加的描边宽度
+            const baseLineWidth = 10;        // 最内层描边宽度（逻辑像素）
+            const widthStep = 0;            // 每层增加的描边宽度
             
             // 透明度
             const baseAlphaMultiplier = 0.9; // 基础透明度乘数（直接乘以强度）
